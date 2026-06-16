@@ -1,0 +1,53 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import ChebConv
+from GNN.GNN import ChebConv_Layer, GAT_Layer
+
+
+class GCN_SaLSTM_block(nn.Module):
+    def __init__(self, input_size, hidden_size, K, embed_dim, num_heads, edge_index, edge_weight):
+        super(GCN_SaLSTM_block, self).__init__()
+        self.hidden_size = hidden_size
+        self.embed_dim = embed_dim
+        self.edge_index = edge_index
+        self.edge_weight = edge_weight
+        self.gcn = ChebConv(in_channels=input_size, out_channels=hidden_size, K=K)
+        self.token_embedding = TokenEmbedding(input_size=hidden_size, d_model=embed_dim)
+        self.multi_head_temporal_self_attention = MultiHeadTemporalSelfAttention(embed_dim, num_heads)
+        self.residual_conv = nn.Conv2d(in_channels=input_size, out_channels=embed_dim, kernel_size=(1, 1), stride=(1, 1))
+
+    def forward(self, input):
+        x = input.transpose(1, 2)
+        batch_size, seq_len, num_nodes, features = x.size()
+        x = x.contiguous().view(batch_size * seq_len, num_nodes, features)
+        x = self.gcn(x, edge_index=self.edge_index, edge_weight=self.edge_weight)
+        x = x.contiguous().view(batch_size, seq_len, num_nodes, self.hidden_size)
+        x = x.transpose(1, 2)
+        x = x.contiguous().view(batch_size * num_nodes, seq_len, self.hidden_size)
+        x = self.token_embedding(x)
+        x, _ = self.multi_head_temporal_self_attention(x)
+        x = x.contiguous().view(batch_size, num_nodes, seq_len, self.embed_dim)
+        x_residual = self.residual_conv(input.permute(0, 3, 1, 2))
+        x = (x_residual + x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        return x
+
+
+class GCN_SaLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, K, embed_dim, num_heads, predict_len, block_num, edge_index, edge_weight):
+        super(GCN_SaLSTM, self).__init__()
+        self.predict_len = predict_len
+        self.embed_dim = embed_dim
+        self.Blocklist = nn.ModuleList([GCN_SaLSTM_block(input_size, hidden_size, K, embed_dim, num_heads, edge_index, edge_weight) if i == 0 else
+                                        GCN_SaLSTM_block(embed_dim, hidden_size, K, embed_dim, num_heads, edge_index, edge_weight)
+                                        for i in range(block_num)])
+        self.linear = nn.Linear(embed_dim, 1)
+
+    def forward(self, x):
+        batch_size, num_nodes, seq_len, _ = x.size()
+        for i in range(len(self.Blocklist)):
+            x = self.Blocklist[i](x)
+        x = x.contiguous().view(batch_size * num_nodes, seq_len, self.embed_dim)
+        x = self.linear(x)
+        x = x.contiguous().view(batch_size, num_nodes, seq_len, 1)
+        return x[:, :, -self.predict_len:, :]
